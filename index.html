@@ -119,7 +119,20 @@ async function fromRozhlasPage(url) {
 }
 
 // --- mujrozhlas.cz: web je za Cloudflare, jde se přes veřejné API ----------
+// Odkaz ze sdílení v aplikaci mujRozhlas obsahuje přímo ID:
+//   https://www.mujrozhlas.cz/rapi/view/serial/<uuid>  (nebo …/episode/<uuid>)
+const UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}";
+
 async function fromMujRozhlas(url) {
+  const direct = new URL(url).pathname.match(new RegExp(`/(serial|episode)s?/(${UUID})`, "i"));
+  const hit = direct
+    ? (await getJSON(`${API}/${direct[1].toLowerCase()}s/${direct[2]}`)).data
+    : await searchBySlug(url);
+  return expand(hit);
+}
+
+// Ostatní odkazy (…/sobotni-drama/nazev-poradu) se hledají podle textu v adrese.
+async function searchBySlug(url) {
   let slug = new URL(url).pathname.replace(/\/+$/, "").split("/").pop();
   slug = slug.replace(/-\d+$/, "");
   const q = encodeURIComponent(slug.replace(/-/g, " "));
@@ -135,8 +148,11 @@ async function fromMujRozhlas(url) {
             a.since || ""];
   };
   const cmp = (x, y) => { for (let i = 0; i < x.length; i++) { if (x[i] > y[i]) return 1; if (x[i] < y[i]) return -1; } return 0; };
-  const hit = hits.reduce((best, h) => cmp(score(h), score(best)) > 0 ? h : best);
+  return hits.reduce((best, h) => cmp(score(h), score(best)) > 0 ? h : best);
+}
 
+// Z nalezeného dílu nebo seriálu udělá seznam dílů ke stažení.
+async function expand(hit) {
   const toEp = (a) => ({
     part: a.part, title: a.title || a.shortTitle,
     duration: (a.audioLinks || [])[0]?.duration || a.duration,
@@ -228,7 +244,8 @@ function render({ title, eps }) {
   eps.forEach((ep) => {
     const li = document.createElement("li");
     li.innerHTML = `<div class="info"><div class="t"></div><div class="m"></div></div>`;
-    li.querySelector(".t").textContent = many ? ep.title : "";
+    const label = ep.part && !/^\d/.test(ep.title) ? `${ep.part}. díl: ${ep.title}` : ep.title;
+    li.querySelector(".t").textContent = many ? label : "";
     const bits = [fmtDur(ep.duration), ep.link ? ep.link.ext.toUpperCase() : null];
     if (ep.link && ep.until) bits.push(`dostupné do ${fmtDate(ep.until)}`);
     li.querySelector(".m").innerHTML = bits.filter(Boolean).join(" · ") +
