@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rozhlas stahovač</title>
+<meta name="theme-color" content="#1b1f3b">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root {
+    --bg: #f5f4f0; --card: #fff; --text: #1d1d1f; --muted: #6b6b72;
+    --accent: #c8102e; --accent-ink: #fff; --line: #e4e2dc; --ok: #1f7a3d; --warn: #b25b00;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141518; --card: #1e2024; --text: #f0f0f2; --muted: #9a9aa3;
+            --line: #2e3036; --ok: #5cc78a; --warn: #f0a04b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--text); }
+  main { max-width: 640px; margin: 0 auto; padding: max(16px, env(safe-area-inset-top)) 16px 48px; }
+  h1 { font-size: 1.35rem; margin: 8px 0 4px; }
+  .sub { color: var(--muted); font-size: .9rem; margin: 0 0 16px; }
+  form { display: flex; gap: 8px; }
+  input[type=url] { flex: 1; min-width: 0; padding: 12px 14px; font: inherit; border-radius: 12px;
+         border: 1px solid var(--line); background: var(--card); color: var(--text); }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 12px 16px;
+         background: var(--accent); color: var(--accent-ink); cursor: pointer; white-space: nowrap; }
+  button.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+  button:disabled { opacity: .5; cursor: default; }
+  .row-actions { display: flex; gap: 8px; margin-top: 8px; }
+  #status { margin: 16px 0; color: var(--muted); min-height: 1.4em; }
+  #status.err { color: var(--accent); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+  .series { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
+  .series button { width: 100%; }
+  .series h2 { font-size: 1.05rem; margin: 0; }
+  .series .meta { color: var(--muted); font-size: .85rem; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+  li .info { flex: 1; min-width: 0; }
+  li .t { font-weight: 550; overflow-wrap: anywhere; }
+  li .m { color: var(--muted); font-size: .82rem; }
+  li .m .gone { color: var(--warn); }
+  li .m .done { color: var(--ok); }
+  li button { padding: 8px 12px; font-size: .9rem; }
+  progress { width: 100%; height: 6px; margin-top: 6px; accent-color: var(--accent); }
+  .help { color: var(--muted); font-size: .85rem; margin-top: 28px; }
+  .help summary { cursor: pointer; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Rozhlas stahovač</h1>
+  <p class="sub">Vlož odkaz z rozhlas.cz nebo mujrozhlas.cz a stáhni si díly do telefonu.</p>
+
+  <form id="f">
+    <input id="url" type="url" inputmode="url" placeholder="https://www.mujrozhlas.cz/…" required autocomplete="off">
+    <button type="submit">Najít</button>
+  </form>
+  <div class="row-actions">
+    <button type="button" class="ghost" id="paste">Vložit ze schránky</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="result"></div>
+
+  <details class="help">
+    <summary>Jak to funguje</summary>
+    <p>Aplikace načte seznam dílů z webu Českého rozhlasu a stáhne zvukové soubory (MP3 nebo M4A)
+    do složky <b>Stažené soubory</b>. Díly, které už rozhlas stáhl z webu, stáhnout nejde.</p>
+    <p>Tip: v menu prohlížeče zvol <b>Přidat na plochu / Nainstalovat aplikaci</b>. Pak se aplikace
+    objeví i v nabídce <b>Sdílet</b> a odkaz jí můžeš poslat přímo z aplikace mujRozhlas.</p>
+  </details>
+</main>
+
+<script>
+const API = "https://api.mujrozhlas.cz";
+const $ = (s) => document.querySelector(s);
+const status = (msg, err = false) => { const s = $("#status"); s.textContent = msg; s.className = err ? "err" : ""; };
+
+const safe = (n) => n.replace(/[\\/:*?"<>|]+/g, "-").trim().slice(0, 150);
+const slugify = (s) => s.normalize("NFKD").replace(/[̀-ͯ]/g, "")
+  .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+const commonPrefix = (a, b) => { let i = 0; while (i < a.length && a[i] === b[i]) i++; return i; };
+const fmtDur = (s) => s ? `${Math.round(s / 60)} min` : "";
+const fmtDate = (d) => d ? new Date(d).toLocaleDateString("cs-CZ", { day: "numeric", month: "numeric", year: "numeric" }) : "";
+
+async function getJSON(u) {
+  const r = await fetch(u);
+  if (!r.ok) throw new Error(`Server vrátil chybu ${r.status}`);
+  return r.json();
+}
+
+// Z odkazu najde v textu první URL (sdílení z aplikací často posílá „Název https://…“).
+function extractUrl(s) {
+  const m = (s || "").match(/https?:\/\/\S+/);
+  return m ? m[0] : (s || "").trim();
+}
+
+// --- *.rozhlas.cz: data jsou ve stránce v atributu data-player -------------
+async function fromRozhlasPage(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Stránku se nepodařilo načíst (${r.status}).`);
+  const doc = new DOMParser().parseFromString(await r.text(), "text/html");
+  const el = doc.querySelector("[data-player]");
+  if (!el) throw new Error("Na stránce jsem nenašel přehrávač.");
+  const d = JSON.parse(el.getAttribute("data-player")).data;
+  const title = d.series?.title || d.playlist[0].title;
+  return {
+    title,
+    eps: d.playlist.map((p) => ({
+      part: p.part, title: p.title, duration: p.duration,
+      until: p.availability?.to, links: p.audioLinks || [],
+    })),
+  };
+}
+
+// --- mujrozhlas.cz: web je za Cloudflare, jde se přes veřejné API ----------
+async function fromMujRozhlas(url) {
+  let slug = new URL(url).pathname.replace(/\/+$/, "").split("/").pop();
+  slug = slug.replace(/-\d+$/, "");
+  const q = encodeURIComponent(slug.replace(/-/g, " "));
+  const hits = (await getJSON(`${API}/search?query=${q}&page%5Blimit%5D=20`)).data
+    .filter((h) => h.type === "episode" || h.type === "serial");
+  if (!hits.length) throw new Error("Pořad jsem v mujRozhlasu nenašel.");
+
+  const score = (h) => {
+    const a = h.attributes;
+    return [commonPrefix(slugify(a.title || ""), slug),
+            h.type === "serial" || (a.audioLinks || []).length > 0 ? 1 : 0,
+            h.type === "serial" ? 1 : 0,
+            a.since || ""];
+  };
+  const cmp = (x, y) => { for (let i = 0; i < x.length; i++) { if (x[i] > y[i]) return 1; if (x[i] < y[i]) return -1; } return 0; };
+  const hit = hits.reduce((best, h) => cmp(score(h), score(best)) > 0 ? h : best);
+
+  const toEp = (a) => ({
+    part: a.part, title: a.title || a.shortTitle,
+    duration: (a.audioLinks || [])[0]?.duration || a.duration,
+    until: (a.audioLinks || [])[0]?.playableTill, links: a.audioLinks || [],
+  });
+
+  let serial = null;
+  if (hit.type === "serial") serial = hit;
+  else if (hit.relationships?.serial?.data) serial = (await getJSON(`${API}/serials/${hit.relationships.serial.data.id}`)).data;
+
+  if (!serial) return { title: hit.attributes.title, eps: [toEp(hit.attributes)] };
+
+  const eps = [];
+  let next = `${API}/serials/${serial.id}/episodes?page%5Blimit%5D=100`;
+  while (next) {
+    const r = await getJSON(next);
+    r.data.forEach((e) => eps.push(toEp(e.attributes)));
+    next = r.links?.next;
+  }
+  eps.sort((a, b) => (+a.part || 0) - (+b.part || 0));
+  return { title: serial.attributes.title, eps };
+}
+
+function pickLink(links) {
+  const by = Object.fromEntries(links.map((a) => [a.variant, a.url]));
+  if (by.mp3) return { url: by.mp3, ext: "mp3" };
+  // Stream …/stream/<id>.m4a/playlist.m3u8 → přímý soubor …/download/<id>.m4a
+  const m = (by.hls || by.dash || "").match(/\/stream\/([^/]+\.m4a)\//);
+  return m ? { url: `https://croaod.cz/download/${m[1]}`, ext: "m4a" } : null;
+}
+
+// --- Stahování: soubor se načte jako blob, aby šel uložit s hezkým názvem ---
+async function download(ep, li) {
+  const btn = li.querySelector("button");
+  const meta = li.querySelector(".m");
+  const bar = document.createElement("progress");
+  bar.max = 1; bar.value = 0;
+  li.querySelector(".info").append(bar);
+  btn.disabled = true;
+  try {
+    const r = await fetch(ep.link.url);
+    if (!r.ok) throw new Error(`chyba ${r.status}`);
+    const total = +r.headers.get("content-length") || 0;
+    const reader = r.body.getReader();
+    const chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      if (total) bar.value = got / total; else bar.removeAttribute("value");
+    }
+    const blob = new Blob(chunks, { type: ep.link.ext === "mp3" ? "audio/mpeg" : "audio/mp4" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = ep.filename;
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+    bar.remove();
+    meta.insertAdjacentHTML("beforeend", ` · <span class="done">staženo (${(got / 1e6).toFixed(0)} MB)</span>`);
+    btn.textContent = "Znovu";
+  } catch (e) {
+    bar.remove();
+    meta.insertAdjacentHTML("beforeend", ` · <span class="gone">nepovedlo se: ${e.message}</span>`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function render({ title, eps }) {
+  const many = eps.length > 1;
+  eps.forEach((ep, i) => {
+    ep.link = pickLink(ep.links);
+    const prefix = many ? String(+ep.part || i + 1).padStart(2, "0") + " - " : "";
+    if (ep.link) ep.filename = `${prefix}${safe(ep.title)}.${ep.link.ext}`;
+  });
+  const ok = eps.filter((e) => e.link);
+
+  const box = document.createElement("div");
+  box.className = "card";
+  box.innerHTML = `
+    <div class="series">
+      <div><h2></h2><div class="meta">${eps.length} ${eps.length === 1 ? "díl" : eps.length < 5 ? "díly" : "dílů"}
+        ${ok.length < eps.length ? ` · ${eps.length - ok.length} už nedostupné` : ""}</div></div>
+      ${many && ok.length ? `<button id="all">Stáhnout vše</button>` : ""}
+    </div><ul></ul>`;
+  box.querySelector("h2").textContent = title;
+  const ul = box.querySelector("ul");
+
+  eps.forEach((ep) => {
+    const li = document.createElement("li");
+    li.innerHTML = `<div class="info"><div class="t"></div><div class="m"></div></div>`;
+    li.querySelector(".t").textContent = many ? ep.title : "";
+    const bits = [fmtDur(ep.duration), ep.link ? ep.link.ext.toUpperCase() : null];
+    if (ep.link && ep.until) bits.push(`dostupné do ${fmtDate(ep.until)}`);
+    li.querySelector(".m").innerHTML = bits.filter(Boolean).join(" · ") +
+      (ep.link ? "" : ` <span class="gone">už není dostupné</span>`);
+    if (ep.link) {
+      const b = document.createElement("button");
+      b.textContent = "Stáhnout";
+      b.onclick = () => download(ep, li);
+      li.append(b);
+    }
+    ep.li = li;
+    ul.append(li);
+  });
+
+  const all = box.querySelector("#all");
+  if (all) all.onclick = async () => {
+    all.disabled = true;
+    for (const ep of ok) { all.textContent = `Stahuji ${ok.indexOf(ep) + 1}/${ok.length}…`; await download(ep, ep.li); }
+    all.textContent = "Hotovo"; all.disabled = false;
+  };
+
+  $("#result").replaceChildren(box);
+}
+
+async function lookup(raw) {
+  const url = extractUrl(raw);
+  $("#url").value = url;
+  $("#result").replaceChildren();
+  let host;
+  try { host = new URL(url).hostname; } catch { return status("To nevypadá jako odkaz.", true); }
+  if (!/(^|\.)(mujrozhlas|rozhlas)\.cz$/.test(host)) return status("Odkaz musí být z rozhlas.cz nebo mujrozhlas.cz.", true);
+  status("Hledám díly…");
+  try {
+    const data = host.endsWith("mujrozhlas.cz") ? await fromMujRozhlas(url) : await fromRozhlasPage(url);
+    status("");
+    render(data);
+  } catch (e) {
+    status(e.message || "Něco se pokazilo.", true);
+  }
+}
+
+$("#f").onsubmit = (e) => { e.preventDefault(); lookup($("#url").value); };
+$("#paste").onclick = async () => {
+  try { const t = await navigator.clipboard.readText(); if (t) lookup(t); }
+  catch { status("Schránku se nepodařilo přečíst — vlož odkaz ručně.", true); }
+};
+
+// Sdílení z jiné aplikace (share_target) nebo ?url=… v adrese
+const params = new URLSearchParams(location.search);
+const shared = params.get("url") || params.get("text") || params.get("title");
+if (shared) { history.replaceState(null, "", location.pathname); lookup(shared); }
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+</script>
+</body>
+</html>
