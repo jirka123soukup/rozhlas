@@ -36,6 +36,8 @@
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
   .series { display: flex; flex-direction: column; gap: 12px; margin-bottom: 12px; }
   .series button { width: 100%; }
+  .series .head { display: flex; gap: 12px; align-items: flex-start; }
+  .series .cover { width: 72px; height: 72px; flex: none; border-radius: 10px; object-fit: cover; }
   .series h2 { font-size: 1.05rem; margin: 0; }
   .series .meta { color: var(--muted); font-size: .85rem; }
   ul { list-style: none; margin: 0; padding: 0; }
@@ -109,11 +111,12 @@ async function fromRozhlasPage(url) {
   if (!el) throw new Error("Na stránce jsem nenašel přehrávač.");
   const d = JSON.parse(el.getAttribute("data-player")).data;
   const title = d.series?.title || d.playlist[0].title;
+  const image = d.poster?.src;
   return {
-    title,
+    title, image,
     eps: d.playlist.map((p) => ({
       part: p.part, title: p.title, duration: p.duration,
-      until: p.availability?.to, links: p.audioLinks || [],
+      until: p.availability?.to, links: p.audioLinks || [], image,
     })),
   };
 }
@@ -157,13 +160,17 @@ async function expand(hit) {
     part: a.part, title: a.title || a.shortTitle,
     duration: (a.audioLinks || [])[0]?.duration || a.duration,
     until: (a.audioLinks || [])[0]?.playableTill, links: a.audioLinks || [],
+    image: a.asset?.url, focal: a.asset?.focal_point,
   });
 
   let serial = null;
   if (hit.type === "serial") serial = hit;
   else if (hit.relationships?.serial?.data) serial = (await getJSON(`${API}/serials/${hit.relationships.serial.data.id}`)).data;
 
-  if (!serial) return { title: hit.attributes.title, eps: [toEp(hit.attributes)] };
+  if (!serial) {
+    const ep = toEp(hit.attributes);
+    return { title: hit.attributes.title, image: ep.image, eps: [ep] };
+  }
 
   const eps = [];
   let next = `${API}/serials/${serial.id}/episodes?page%5Blimit%5D=100`;
@@ -173,7 +180,133 @@ async function expand(hit) {
     next = r.links?.next;
   }
   eps.sort((a, b) => (+a.part || 0) - (+b.part || 0));
-  return { title: serial.attributes.title, eps };
+  const sa = serial.attributes.asset;
+  eps.forEach((e) => { if (!e.image && sa) { e.image = sa.url; e.focal = sa.focal_point; } });
+  return { title: serial.attributes.title, image: sa?.url, eps };
+}
+
+// --- Obal (miniatura): stáhne obrázek, ořízne na čtverec 800×800 ------------
+const coverCache = new Map();
+function getCover(url, focal) {
+  if (!url) return Promise.resolve(null);
+  if (!coverCache.has(url)) coverCache.set(url, (async () => {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const bmp = await createImageBitmap(await r.blob());
+    const [fx, fy] = (focal || "50,50").split(",").map((n) => +n / 100);
+    const side = Math.min(bmp.width, bmp.height);
+    const sx = Math.max(0, Math.min(bmp.width - side, bmp.width * fx - side / 2));
+    const sy = Math.max(0, Math.min(bmp.height - side, bmp.height * fy - side / 2));
+    const out = Math.min(800, side);
+    const c = document.createElement("canvas");
+    c.width = c.height = out;
+    c.getContext("2d").drawImage(bmp, sx, sy, side, side, 0, 0, out, out);
+    const blob = await new Promise((res) => c.toBlob(res, "image/jpeg", 0.88));
+    return new Uint8Array(await blob.arrayBuffer());
+  })().catch(() => null));
+  return coverCache.get(url);
+}
+
+// --- Zápis metadat (název, pořad, číslo dílu, obal) přímo do zvukového souboru
+const enc = new TextEncoder();
+const bytes = (s) => Uint8Array.from(s, (c) => c.charCodeAt(0) & 0xff);
+const concat = (...parts) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0; for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+};
+const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n); return b; };
+
+// MP4/M4A: atomy moov › udta › meta › ilst
+const atom = (type, ...parts) => { const body = concat(...parts); return concat(u32(body.length + 8), bytes(type), body); };
+const dataAtom = (kind, payload) => atom("data", u32(kind), u32(0), payload);
+
+function mp4Udta({ title, album, track, total, cover }) {
+  const items = [
+    atom("\xa9nam", dataAtom(1, enc.encode(title))),
+    atom("\xa9alb", dataAtom(1, enc.encode(album))),
+    atom("\xa9ART", dataAtom(1, enc.encode("Český rozhlas"))),
+    atom("\xa9gen", dataAtom(1, enc.encode("Audiobook"))),
+  ];
+  if (track) items.push(atom("trkn", dataAtom(0, new Uint8Array([0, 0, track >> 8, track & 255, total >> 8, total & 255, 0, 0]))));
+  if (cover) items.push(atom("covr", dataAtom(13, cover)));
+  const hdlr = atom("hdlr", new Uint8Array(8), bytes("mdirappl"), new Uint8Array(9));
+  return atom("udta", atom("meta", new Uint8Array(4), hdlr, atom("ilst", ...items)));
+}
+
+function* children(buf, start, end) {
+  const dv = new DataView(buf.buffer, buf.byteOffset);
+  for (let i = start; i + 8 <= end;) {
+    let size = dv.getUint32(i), head = 8;
+    if (size === 1) { size = Number(dv.getBigUint64(i + 8)); head = 16; }
+    if (size === 0) size = end - i;
+    if (size < head) return;
+    yield { type: String.fromCharCode(...buf.subarray(i + 4, i + 8)), start: i, size, head };
+    i += size;
+  }
+}
+
+// Posune ukazatele na zvuková data (stco/co64), pokud se moov nachází před nimi.
+function shiftChunkOffsets(moov, delta) {
+  const dv = new DataView(moov.buffer, moov.byteOffset);
+  const walk = (s, e) => {
+    for (const b of children(moov, s, e)) {
+      if (["trak", "mdia", "minf", "stbl"].includes(b.type)) walk(b.start + b.head, b.start + b.size);
+      else if (b.type === "stco" || b.type === "co64") {
+        const n = dv.getUint32(b.start + 12);
+        for (let k = 0; k < n; k++) {
+          if (b.type === "stco") { const p = b.start + 16 + k * 4; dv.setUint32(p, dv.getUint32(p) + delta); }
+          else { const p = b.start + 16 + k * 8; dv.setBigUint64(p, dv.getBigUint64(p) + BigInt(delta)); }
+        }
+      }
+    }
+  };
+  walk(8, moov.length);
+}
+
+async function tagMp4(blob, meta) {
+  // Najde moov mezi atomy nejvyšší úrovně (čte jen hlavičky).
+  let pos = 0, moovPos = -1, moovSize = 0, mdatPos = -1;
+  while (pos + 8 <= blob.size) {
+    const h = new DataView(await blob.slice(pos, pos + 16).arrayBuffer());
+    let size = h.getUint32(0);
+    const type = String.fromCharCode(h.getUint8(4), h.getUint8(5), h.getUint8(6), h.getUint8(7));
+    if (size === 1) size = Number(h.getBigUint64(8));
+    if (size === 0) size = blob.size - pos;
+    if (size < 8) break;
+    if (type === "moov") { moovPos = pos; moovSize = size; }
+    if (type === "mdat" && mdatPos < 0) mdatPos = pos;
+    pos += size;
+  }
+  if (moovPos < 0) throw new Error("moov nenalezen");
+  const old = new Uint8Array(await blob.slice(moovPos, moovPos + moovSize).arrayBuffer());
+  const kept = [...children(old, 8, old.length)].filter((b) => b.type !== "udta")
+    .map((b) => old.subarray(b.start, b.start + b.size));
+  const moov = atom("moov", ...kept, mp4Udta(meta));
+  if (mdatPos > moovPos) shiftChunkOffsets(moov, moov.length - moovSize);
+  return new Blob([blob.slice(0, moovPos), moov, blob.slice(moovPos + moovSize)], { type: "audio/mp4" });
+}
+
+// MP3: nový štítek ID3v2.3 na začátek (případný původní se nahradí)
+function id3Tag({ title, album, track, total, cover }) {
+  const utf16 = (s) => { const b = new Uint8Array(s.length * 2); s.split("").forEach((c, i) => { const n = c.charCodeAt(0); b[i * 2] = n & 255; b[i * 2 + 1] = n >> 8; }); return b; };
+  const text = (s) => concat(new Uint8Array([1, 0xff, 0xfe]), utf16(s), new Uint8Array(2));
+  const frame = (id, body) => concat(bytes(id), u32(body.length), new Uint8Array(2), body);
+  const frames = [frame("TIT2", text(title)), frame("TALB", text(album)), frame("TPE1", text("Český rozhlas"))];
+  if (track) frames.push(frame("TRCK", text(`${track}/${total}`)));
+  if (cover) frames.push(frame("APIC", concat(new Uint8Array([0]), bytes("image/jpeg"), new Uint8Array([0, 3, 0]), cover)));
+  const body = concat(...frames);
+  const n = body.length;
+  return concat(bytes("ID3"), new Uint8Array([3, 0, 0, (n >> 21) & 127, (n >> 14) & 127, (n >> 7) & 127, n & 127]), body);
+}
+
+async function tagMp3(blob, meta) {
+  const h = new Uint8Array(await blob.slice(0, 10).arrayBuffer());
+  let skip = 0;
+  if (h[0] === 0x49 && h[1] === 0x44 && h[2] === 0x33) {
+    skip = 10 + ((h[6] << 21) | (h[7] << 14) | (h[8] << 7) | h[9]) + (h[5] & 0x10 ? 10 : 0);
+  }
+  return new Blob([id3Tag(meta), blob.slice(skip)], { type: "audio/mpeg" });
 }
 
 function pickLink(links) {
@@ -204,14 +337,20 @@ async function download(ep, li) {
       chunks.push(value); got += value.length;
       if (total) bar.value = got / total; else bar.removeAttribute("value");
     }
-    const blob = new Blob(chunks, { type: ep.link.ext === "mp3" ? "audio/mpeg" : "audio/mp4" });
+    let blob = new Blob(chunks, { type: ep.link.ext === "mp3" ? "audio/mpeg" : "audio/mp4" });
+    let tagged = false;
+    try {
+      const cover = await getCover(ep.image, ep.focal);
+      blob = await (ep.link.ext === "mp3" ? tagMp3 : tagMp4)(blob, { ...ep.tags, cover });
+      tagged = !!cover;
+    } catch (e) { console.warn("Metadata se nepodařilo zapsat:", e); }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = ep.filename;
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
     bar.remove();
-    meta.insertAdjacentHTML("beforeend", ` · <span class="done">staženo (${(got / 1e6).toFixed(0)} MB)</span>`);
+    meta.insertAdjacentHTML("beforeend", ` · <span class="done">staženo (${(got / 1e6).toFixed(0)} MB${tagged ? ", s obalem" : ""})</span>`);
     btn.textContent = "Znovu";
   } catch (e) {
     bar.remove();
@@ -221,12 +360,15 @@ async function download(ep, li) {
   }
 }
 
-function render({ title, eps }) {
+function render({ title, image, eps }) {
   const many = eps.length > 1;
   eps.forEach((ep, i) => {
     ep.link = pickLink(ep.links);
-    const prefix = many ? String(+ep.part || i + 1).padStart(2, "0") + " - " : "";
+    const n = +ep.part || i + 1;
+    const prefix = many ? String(n).padStart(2, "0") + " - " : "";
     if (ep.link) ep.filename = `${prefix}${safe(ep.title)}.${ep.link.ext}`;
+    ep.label = many && !/^\d/.test(ep.title) ? `${n}. díl: ${ep.title}` : ep.title;
+    ep.tags = { title: ep.label, album: title, track: many ? n : 0, total: eps.length };
   });
   const ok = eps.filter((e) => e.link);
 
@@ -234,18 +376,18 @@ function render({ title, eps }) {
   box.className = "card";
   box.innerHTML = `
     <div class="series">
-      <div><h2></h2><div class="meta">${eps.length} ${eps.length === 1 ? "díl" : eps.length < 5 ? "díly" : "dílů"}
-        ${ok.length < eps.length ? ` · ${eps.length - ok.length} už nedostupné` : ""}</div></div>
+      <div class="head">${image ? `<img class="cover" alt="">` : ""}<div><h2></h2><div class="meta">${eps.length} ${eps.length === 1 ? "díl" : eps.length < 5 ? "díly" : "dílů"}
+        ${ok.length < eps.length ? ` · ${eps.length - ok.length} už nedostupné` : ""}</div></div></div>
       ${many && ok.length ? `<button id="all">Stáhnout vše</button>` : ""}
     </div><ul></ul>`;
   box.querySelector("h2").textContent = title;
+  if (image) box.querySelector(".cover").src = image;
   const ul = box.querySelector("ul");
 
   eps.forEach((ep) => {
     const li = document.createElement("li");
     li.innerHTML = `<div class="info"><div class="t"></div><div class="m"></div></div>`;
-    const label = ep.part && !/^\d/.test(ep.title) ? `${ep.part}. díl: ${ep.title}` : ep.title;
-    li.querySelector(".t").textContent = many ? label : "";
+    li.querySelector(".t").textContent = many ? ep.label : "";
     const bits = [fmtDur(ep.duration), ep.link ? ep.link.ext.toUpperCase() : null];
     if (ep.link && ep.until) bits.push(`dostupné do ${fmtDate(ep.until)}`);
     li.querySelector(".m").innerHTML = bits.filter(Boolean).join(" · ") +
